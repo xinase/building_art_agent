@@ -1,13 +1,17 @@
 import streamlit as st
 import os
+import hashlib
+import json
 from datetime import datetime
+import shutil
 
-
-# === 必须在最开头初始化 session state ===
+# === 1. 初始化 Session State (必须在最前) ===
 if 'search_history' not in st.session_state:
     st.session_state.search_history = []
 if 'current_query' not in st.session_state:
     st.session_state.current_query = ""
+if 'input_key' not in st.session_state:
+    st.session_state.input_key = 0
 
 from langchain_chroma import Chroma
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
@@ -15,53 +19,122 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 
-
-
-# 设置页面基本信息
 st.set_page_config(page_title="《构建之法》智能助教", layout="wide")
-st.title("《构建之法》智能助教 (本地测试版)")
+st.title("《构建之法》智能助教 (增量更新版)")
 
-@st.cache_resource
-def init_system():
-    print("\n[DEBUG] --- 系统初始化开始 ---")
-    persist_dir = "./chroma_db"
-    knowledge_dir = "./knowledge_base"  # 移到函数开头
+# === 工具函数 ===
 
-    # 1. 初始化 Embedding 模型
-    print("[DEBUG] 正在加载 Embedding 模型...")
+def get_file_hash(file_path):
+    """计算文件的MD5哈希值"""
     try:
-        embeddings = HuggingFaceEmbeddings(model_name="GanymedeNil/text2vec-large-chinese")
+        with open(file_path, 'rb') as f:
+            file_content = f.read()
+            file_stat = os.stat(file_path)
+            combined_data = file_content + str(file_stat.st_size).encode()
+            return hashlib.md5(combined_data).hexdigest()
     except Exception as e:
-        st.error(f"模型加载失败，请检查网络或缓存: {e}")
+        print(f"[DEBUG] 无法计算文件哈希 {file_path}: {e}")
         return None
 
-    # 2. 检查是否需要重建（新增的逻辑）
-    need_rebuild = needs_rebuild(persist_dir, knowledge_dir)
+def load_file_metadata(persist_dir):
+    """加载文件元数据"""
+    metadata_file = os.path.join(persist_dir, "file_metadata.json")
+    if os.path.exists(metadata_file):
+        try:
+            with open(metadata_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                print(f"[DEBUG] 从 {metadata_file} 加载了 {len(data)} 个文件的元数据")
+                return data
+        except Exception as e:
+            print(f"[DEBUG] 加载元数据失败: {e}")
+            return {}
+    else:
+        print(f"[DEBUG] 元数据文件不存在: {metadata_file}")
+    return {}
+
+def save_file_metadata(persist_dir, metadata):
+    """保存文件元数据"""
+    # 确保目录存在
+    os.makedirs(persist_dir, exist_ok=True)
     
-    # 如果不需要重建且数据库存在，直接加载
-    if not need_rebuild:
-        db_file_path = os.path.join(persist_dir, "chroma.sqlite3")
-        if os.path.exists(db_file_path):
-            print(f"[DEBUG] ✅ 发现本地数据库 ({db_file_path})，正在直接加载...")
-            try:
-                vectordb = Chroma(
-                    persist_directory=persist_dir,
-                    embedding_function=embeddings
-                )
-                print("[DEBUG] 本地数据库加载成功！")
-                return vectordb
-            except Exception as e:
-                print(f"[DEBUG] ⚠️ 本地数据库加载出错，将尝试重新构建: {e}")
-                need_rebuild = True
+    metadata_file = os.path.join(persist_dir, "file_metadata.json")
+    try:
+        with open(metadata_file, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        print(f"[DEBUG] ✅ 已保存 {len(metadata)} 个文件的元数据到 {metadata_file}")
+    except Exception as e:
+        print(f"[DEBUG] ❌ 无法保存文件元数据: {e}")
 
-    # 3. 需要重建或数据库不存在
-    print("[DEBUG] ⚠️ 开始构建/更新向量数据库 (这可能需要一些时间)...")
-
+def get_changed_files(knowledge_dir, existing_metadata):
+    """获取需要更新的文件列表"""
+    changed_files = []
+    new_files = []
+    
     if not os.path.exists(knowledge_dir):
-        st.error(f"知识库文件夹不存在：{knowledge_dir}")
-        return None
+        print(f"[DEBUG] 知识库目录不存在: {knowledge_dir}")
+        return [], [], []
+    
+    # 扫描当前磁盘上的文件
+    current_files_set = set()
+    for root, dirs, files in os.walk(knowledge_dir):
+        for file in files:
+            if file.endswith('.txt'):
+                file_path = os.path.join(root, file)
+                current_files_set.add(file_path)
+                
+                current_hash = get_file_hash(file_path)
+                if not current_hash: 
+                    continue
+                
+                if file_path in existing_metadata:
+                    if existing_metadata[file_path]['hash'] != current_hash:
+                        changed_files.append(file_path)  # 内容变了
+                        print(f"[DEBUG] 检测到文件修改: {os.path.basename(file_path)}")
+                else:
+                    new_files.append(file_path)  # 这是一个全新的文件
+                    print(f"[DEBUG] 检测到新文件: {os.path.basename(file_path)}")
+    
+    # 检查有哪些文件在元数据里有，但磁盘上删了
+    deleted_files = [f for f in existing_metadata if f not in current_files_set]
+    for deleted_file in deleted_files:
+        print(f"[DEBUG] 检测到文件删除: {os.path.basename(deleted_file)}")
+    
+    return changed_files, new_files, deleted_files
 
-    # 定义支持 GBK 的加载器
+def update_vector_database(vectordb, knowledge_dir, existing_metadata):
+    """执行增量更新 - 简单进度显示"""
+    print("[DEBUG] 🔄 检查增量更新...")
+    
+    changed_files, new_files, deleted_files = get_changed_files(knowledge_dir, existing_metadata)
+    
+    if not changed_files and not new_files and not deleted_files:
+        print("[DEBUG] ✅ 所有文件已是最新的，无需更新")
+        return existing_metadata
+    
+    print(f"[DEBUG] 变更统计: 新增 {len(new_files)}, 修改 {len(changed_files)}, 删除 {len(deleted_files)}")
+
+    # 1. 处理删除的文件
+    for file_path in deleted_files:
+        try:
+            vectordb._collection.delete(where={"source": file_path})
+            if file_path in existing_metadata:
+                del existing_metadata[file_path]
+            print(f"[DEBUG] ✅ 已删除无效索引: {os.path.basename(file_path)}")
+        except Exception as e:
+            print(f"[DEBUG] ❌ 删除失败: {e}")
+
+    # 2. 处理修改和新增的文件
+    files_to_process = changed_files + new_files
+    
+    # 清理修改文件的旧向量
+    for file_path in changed_files:
+        try:
+            vectordb._collection.delete(where={"source": file_path})
+            print(f"[DEBUG] ✅ 已清理旧向量: {os.path.basename(file_path)}")
+        except Exception as e:
+            print(f"[DEBUG] ❌ 清理旧向量失败: {e}")
+
+    # 定义加载器
     class CustomTextLoader(TextLoader):
         def __init__(self, file_path: str):
             super().__init__(file_path, encoding="gbk")
@@ -69,157 +142,171 @@ def init_system():
             try:
                 yield from super().lazy_load()
             except Exception as e:
-                # 如果 GBK 失败，尝试 utf-8 容错
                 try:
                     self.encoding = "utf-8"
                     yield from super().lazy_load()
-                except Exception as e2:
-                    st.warning(f"无法读取文件 {self.file_path}: {e}")
+                except:
+                    print(f"[DEBUG] ❌ 无法读取文件 {self.file_path}")
                     return
 
-    # 加载文件
-    print("[DEBUG] 开始扫描并加载文档...")
-    loader = DirectoryLoader(
-        knowledge_dir,
-        glob="**/*.txt",
-        loader_cls=CustomTextLoader,
-        show_progress=True
-    )
+    if files_to_process:
+        print(f"[DEBUG] 正在处理 {len(files_to_process)} 个文件...")
+        documents = []
+        for file_path in files_to_process:
+            try:
+                loader = CustomTextLoader(file_path)
+                file_docs = loader.load()
+                documents.extend(file_docs)
+                print(f"[DEBUG] ✅ 成功加载: {os.path.basename(file_path)}")
+            except Exception as e:
+                print(f"[DEBUG] ❌ 跳过文件 {file_path}: {e}")
 
-    documents = loader.load()
-    if not documents:
-        st.error("❌ 没有加载到任何文档，请检查 knowledge_base 文件夹")
+        if documents:
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+            texts = text_splitter.split_documents(documents)
+            print(f"[DEBUG] 文本已切分为 {len(texts)} 个块")
+            
+            if texts:
+                # 分批写入，每10个块输出一次进度
+                batch_size = 10
+                total_batches = (len(texts) + batch_size - 1) // batch_size
+                
+                print(f"[DEBUG] 开始分批写入，共 {total_batches} 批...")
+                
+                for i in range(0, len(texts), batch_size):
+                    batch = texts[i:i + batch_size]
+                    vectordb.add_documents(batch)
+                    
+                    current_batch = i // batch_size + 1
+                    processed = min(i + batch_size, len(texts))
+                    print(f"[DEBUG] ✅ 已完成第 {current_batch}/{total_batches} 批，已处理 {processed}/{len(texts)} 个块")
+                
+                print(f"[DEBUG] ✅ 所有 {len(texts)} 个文本块已成功添加到数据库")
+                
+                # 更新元数据
+                for file_path in files_to_process:
+                    file_hash = get_file_hash(file_path)
+                    if file_hash:
+                        existing_metadata[file_path] = {
+                            'hash': file_hash,
+                            'last_updated': datetime.now().isoformat(),
+                            'chunk_count': len([t for t in texts if t.metadata.get('source') == file_path])
+                        }
+    else:
+        print("[DEBUG] 没有需要处理的文件")
+
+    return existing_metadata
+
+
+@st.cache_resource
+def init_system():
+    print("\n[DEBUG] --- 系统初始化 ---")
+    persist_dir = "./chroma_db"
+    knowledge_dir = "./knowledge_base"
+    
+    # 确保知识库目录存在
+    if not os.path.exists(knowledge_dir):
+        st.error(f"❌ 知识库目录不存在: {knowledge_dir}")
         return None
-    print(f"[DEBUG] 成功加载 {len(documents)} 个文档片段")
+    
+    # 1. 加载 Embedding
+    try:
+        print("[DEBUG] 正在加载 Embedding 模型...")
+        embeddings = HuggingFaceEmbeddings(model_name="GanymedeNil/text2vec-large-chinese")
+    except Exception as e:
+        st.error(f"❌ 模型加载失败: {e}")
+        return None
 
-    # 切分文本
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    texts = text_splitter.split_documents(documents)
-    print(f"[DEBUG] 文本已切分为 {len(texts)} 个块")
-
-    # 构建并保存数据库
-    print("[DEBUG] 正在计算向量并写入数据库 (Chroma)...")
-    vectordb = Chroma.from_documents(
-        documents=texts,
-        embedding=embeddings,
-        persist_directory=persist_dir
-    )
-    print("[DEBUG] ✅ 数据库构建完成并已保存！")
-
+    # 2. 初始化/加载 Chroma
+    print("[DEBUG] 正在初始化向量数据库...")
+    try:
+        vectordb = Chroma(
+            persist_directory=persist_dir,
+            embedding_function=embeddings
+        )
+    except Exception as e:
+        st.error(f"❌ 向量数据库初始化失败: {e}")
+        return None
+    
+    # 3. 加载元数据并执行增量更新
+    file_metadata = load_file_metadata(persist_dir)
+    updated_metadata = update_vector_database(vectordb, knowledge_dir, file_metadata)
+    save_file_metadata(persist_dir, updated_metadata)
+    
+    print("[DEBUG] ✅ 系统初始化完成")
     return vectordb
 
-def needs_rebuild(persist_dir, knowledge_dir):
-    """
-    检查是否需要重新构建向量数据库
-    返回 True 如果需要重建，False 如果可以使用现有数据库
-    """
-    # 检查数据库目录是否存在
-    if not os.path.exists(persist_dir):
-        print("[DEBUG] 向量数据库目录不存在，需要构建")
-        return True
-    
-    # 检查数据库文件是否存在
-    db_file = os.path.join(persist_dir, "chroma.sqlite3")
-    if not os.path.exists(db_file):
-        print("[DEBUG] 向量数据库文件不存在，需要构建")
-        return True
-    
-    # 检查知识库目录是否存在
-    if not os.path.exists(knowledge_dir):
-        print("[DEBUG] 知识库目录不存在")
-        return False
-    
-    # 获取数据库的最后修改时间
-    try:
-        db_mtime = os.path.getmtime(db_file)
-    except OSError:
-        print("[DEBUG] 无法获取数据库文件修改时间，需要重建")
-        return True
-    
-    # 遍历知识库中的所有txt文件，检查是否有文件比数据库更新
-    for root, dirs, files in os.walk(knowledge_dir):
-        for file in files:
-            if file.endswith('.txt'):
-                file_path = os.path.join(root, file)
-                try:
-                    file_mtime = os.path.getmtime(file_path)
-                    if file_mtime > db_mtime:
-                        print(f"[DEBUG] 检测到更新的文件: {file}，需要重建数据库")
-                        return True
-                except OSError:
-                    # 如果无法获取某个文件的修改时间，继续检查其他文件
-                    continue
-    
-    print("[DEBUG] 知识库无更新，使用现有数据库")
-    return False
-
-# 初始化系统
+# === 系统初始化 ===
 vectordb = init_system()
 
 def create_retrieval_chain(retriever):
-    # 修复后的 LCEL 链：
-    # 1. 并行执行：检索文档(source_documents) 和 透传问题(current_query)
-    step1 = RunnableParallel(
+    return RunnableParallel(
         source_documents=retriever,
-        current_query=RunnablePassthrough()
+        question=RunnablePassthrough()
     )
 
-    # 2. 如果未来接入 LLM，可以在这里用 .assign() 添加 context 和 prompt
-    # 目前 MVP 阶段，我们只需要 step1 的结果来展示检索到的内容
-    return step1
-
+# === 界面逻辑 ===
 if vectordb:
-    # 侧边栏配置
+    # 侧边栏
     with st.sidebar:
         st.header("设置")
-        k_val = st.slider("检索文档数量 (K)", min_value=3, max_value=10, value=5)
-        # 搜索历史区域
+        k_val = st.slider("检索文档数量 (K)", 3, 10, 3)
+        
+        st.divider()
         st.header("📚 搜索历史")
-    
+        
+        # 历史记录点击处理
         if st.session_state.search_history:
-            # 显示最近的搜索记录（最新的在前面）
-            for i, history_item in enumerate(reversed(st.session_state.search_history[-10:])):  # 只显示最近10条
-                query, timestamp = history_item
-                time_str = timestamp.strftime("%H:%M")
-                
-                # 点击历史记录可以重新搜索
-                if st.button(f"{i+1}. {query}", key=f"history_{i}"):
-                    st.session_state.current_query = query
+            for i, (hist_query, timestamp) in enumerate(reversed(st.session_state.search_history[-10:])):
+                if st.button(f"{hist_query}", key=f"hist_{i}"):
+                    st.session_state.current_query = hist_query
+                    st.session_state.input_key += 1
                     st.rerun()
         else:
-            st.caption("暂无搜索历史")
+            st.caption("暂无历史")
 
+        st.divider()
+        if st.button("🗑️ 清空所有数据"):
+            st.cache_resource.clear()
+            if os.path.exists("./chroma_db"):
+                shutil.rmtree("./chroma_db")
+            st.success("已重置，请刷新页面")
+            st.rerun()
+
+    # 主界面
     retriever = vectordb.as_retriever(search_kwargs={"k": k_val})
-    retrieval_chain = create_retrieval_chain(retriever)
+    chain = create_retrieval_chain(retriever)
 
-    # 主界面输入
-    current_query = st.text_input("请输入关于《构建之法》的问题：", placeholder="例如：什么是结对编程？")
+    # 搜索框
+    query = st.text_input(
+        "请输入问题：", 
+        value=st.session_state.current_query,
+        key=f"search_input_{st.session_state.input_key}" 
+    )
 
-    if current_query:
-        # 添加到搜索历史（避免重复添加相同的查询）
-        if not st.session_state.search_history or st.session_state.search_history[-1][0] != current_query:
-            st.session_state.search_history.append((current_query, datetime.now()))
+    # 执行搜索逻辑
+    if query:
+        # 如果是新输入的内容，更新 Session 并保存历史
+        if query != st.session_state.current_query:
+            st.session_state.current_query = query
         
-        with st.spinner('正在书中为您寻找答案...'):
-            result = retrieval_chain.invoke(current_query)
+        # 添加历史记录 (去重)
+        if not st.session_state.search_history or st.session_state.search_history[-1][0] != query:
+            st.session_state.search_history.append((query, datetime.now()))
 
-    if current_query:
-        with st.spinner('正在书中为您寻找答案...'):
-            # 执行检索
-            result = retrieval_chain.invoke(current_query)
+        with st.spinner('🔍 正在检索...'):
+            result = chain.invoke(query)
+            
+            # 结果展示
+            if result.get('source_documents'):
+                st.subheader(f"找到 {len(result['source_documents'])} 个相关片段：")
+                for i, doc in enumerate(result['source_documents']):
+                    src = os.path.basename(doc.metadata.get('source', '未知'))
+                    with st.expander(f"参考 {i+1}: {src}", expanded=(i == 0)):  # 只展开第一个
+                        st.markdown(doc.page_content)
+                        st.caption(f"来源: {src}")
+            else:
+                st.warning("未找到相关内容。")
 
-        # 结果展示区
-        st.subheader("📖 书中相关原文片段：")
-
-        # 结果校验
-        if not result.get('source_documents'):
-            st.warning("没有找到相关文档。")
-        else:
-            for i, doc in enumerate(result['source_documents']):
-                source_name = os.path.basename(doc.metadata.get('source', '未知文件'))
-                with st.expander(f"参考片段 {i+1} (来源: {source_name})", expanded=True):
-                    st.markdown(f"**原文内容：**\n\n{doc.page_content}")
-                    st.caption(f"元数据: {doc.metadata}")
 else:
-    st.info("系统正在初始化，请查看终端输出...")
-
+    st.info("系统初始化中...")
